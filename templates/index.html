@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flask Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="container">
+    <div class="card">
+        <h1>Youssef Loves Khoukha and Khoukha loves Youssef </h1>
+
+        <p>
+            Welcome Again
+        </p>
+
+        <button onclick="showMessage()">
+            Click Me
+        </button>
+
+        <p id="message"></p>
+    </div>
+</div>
+
+<script>
+function showMessage() {
+    document.getElementById("message").innerHTML =
+        "✅ Flask is working perfectly!";
+}
+</script>
+
+</body>
+</html>
