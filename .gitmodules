@@ -1,0 +1,6 @@
+[submodule "Embedded-Linux-Yocto"]
+	path = Embedded-Linux-Yocto
+	url = https://github.com/youssefjazi/Embedded-Linux-Yocto.git
+[submodule "Terraform-Practice"]
+	path = Terraform-Practice
+	url = https://github.com/youssefjazi/Terraform-Practice.git

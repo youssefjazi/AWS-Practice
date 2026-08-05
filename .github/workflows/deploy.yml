@@ -1,0 +1,35 @@
+name: Deploy Virtual ECU
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Copy project to EC2
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/ec2_key" \
+            ./ \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USER }}/Embedded-Linux-Yocto/"
+
+      - name: Run Ansible playbook on EC2
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "cd /home/${{ secrets.EC2_USER }}/Embedded-Linux-Yocto && \
+             ansible-playbook -i inventory/hosts.yml playbook.yml"
