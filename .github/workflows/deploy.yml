@@ -1,35 +1,449 @@
-name: Deploy Virtual ECU
+name: PR AWS Integration Test
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: eu-north-1
+  TERRAFORM_DIR: Terraform-Practice/terraform
+  ANSIBLE_PLAYBOOK: Terraform-Practice/ansible/virtual_ecu.yaml
 
 jobs:
-  deploy:
+  deploy-test-destroy:
+    name: Terraform -> Ansible -> Test -> Destroy
     runs-on: ubuntu-latest
 
+
     steps:
+
+  # ============================================================
+  # 1. Checkout repository and submodules
+  # ============================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Configure SSH
+  # ============================================================
+  # 2. Setup Terraform
+  # ============================================================
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+  # ============================================================
+  # 3. Configure AWS credentials
+  # ============================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+  # ============================================================
+  # 4. Verify AWS credentials
+  # ============================================================
+
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity
+
+  # ============================================================
+  # 5. Get GitHub Actions runner public IP
+  # ============================================================
+
+      - name: Get runner public IP
+        id: runner_ip
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
+          IP=$(curl -s https://checkip.amazonaws.com)
+    
+          echo "Runner public IP: ${IP}"
+    
+          echo "ip=${IP}/32" >> "${GITHUB_OUTPUT}"
 
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+  # ============================================================
+  # 6. Configure EC2 SSH key
+  # ============================================================
 
-      - name: Copy project to EC2
+      - name: Configure SSH key
         run: |
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/ec2_key" \
-            ./ \
-            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USER }}/Embedded-Linux-Yocto/"
+          mkdir -p "${HOME}/.ssh"
+    
+          printf '%s\n' "${{ secrets.EC2_SSH_PRIVATE_KEY }}" \
+            > "${HOME}/.ssh/ec2_key"
+    
+          chmod 600 "${HOME}/.ssh/ec2_key"
 
-      - name: Run Ansible playbook on EC2
+  # ============================================================
+  # 7. Terraform Init
+  # ============================================================
+
+      - name: Terraform Init
+        id: terraform_init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init
+
+  # ============================================================
+  # 8. Terraform Validate
+  # ============================================================
+
+      - name: Terraform Validate
+        id: terraform_validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform validate
+
+  # ============================================================
+  # 9. Terraform Plan
+  # ============================================================
+
+      - name: Terraform Plan
+        id: terraform_plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
         run: |
-          ssh -i ~/.ssh/ec2_key \
-            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-            "cd /home/${{ secrets.EC2_USER }}/Embedded-Linux-Yocto && \
-             ansible-playbook -i inventory/hosts.yml playbook.yml"
+          terraform plan \
+            -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
+            -var="allowed_ip=${{ steps.runner_ip.outputs.ip }}"
+
+  # ============================================================
+  # 10. Terraform Apply
+  # ============================================================
+
+      - name: Terraform Apply
+        id: terraform_apply
+        continue-on-error: true
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
+            -var="allowed_ip=${{ steps.runner_ip.outputs.ip }}"
+
+  # ============================================================
+  # 11. Get EC2 public IP
+  # ============================================================
+
+      - name: Get EC2 public IP
+        id: ec2
+        if: steps.terraform_apply.outcome == 'success'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          EC2_IP=$(terraform output -raw public_ip)
+    
+          echo "EC2 public IP: ${EC2_IP}"
+    
+          echo "ip=${EC2_IP}" >> "${GITHUB_OUTPUT}"
+
+  # ============================================================
+  # 12. Create Ansible inventory
+  # ============================================================
+
+      - name: Create Ansible inventory
+        if: steps.terraform_apply.outcome == 'success'
+        run: |
+          cat > inventory.ini <<EOF
+          [virtual_ecu]
+          ${{ steps.ec2.outputs.ip }} ansible_user=ec2-user
+          EOF
+    
+          echo "Ansible inventory:"
+          cat inventory.ini
+
+  # ============================================================
+  # 13. Wait for EC2 SSH
+  # ============================================================
+
+      - name: Wait for EC2 SSH
+        id: wait_ssh
+        if: steps.terraform_apply.outcome == 'success'
+        continue-on-error: true
+        run: |
+          echo "Waiting for EC2 SSH..."
+    
+          for i in {1..30}; do
+    
+            if ssh \
+              -i "${HOME}/.ssh/ec2_key" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=5 \
+              "ec2-user@${{ steps.ec2.outputs.ip }}" \
+              "echo SSH_READY" 2>/dev/null; then
+    
+              echo "EC2 SSH is ready."
+              exit 0
+            fi
+    
+            echo "Attempt ${i}/30 failed."
+            sleep 10
+    
+          done
+    
+          echo "EC2 SSH did not become available."
+          exit 1
+
+  # ============================================================
+  # 14. Install Ansible
+  # ============================================================
+
+      - name: Install Ansible
+        if: steps.terraform_apply.outcome == 'success'
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ansible
+
+      # ============================================================
+      # 15. Test Ansible connection
+      # ============================================================
+
+      - name: Test Ansible connection
+        id: ansible_ping
+        if: steps.terraform_apply.outcome == 'success'
+        continue-on-error: true
+        run: |
+          ansible \
+            -i inventory.ini \
+            virtual_ecu \
+            -m ping \
+            --private-key "${HOME}/.ssh/ec2_key"
+
+  # ============================================================
+  # 16. Run Ansible playbook on EC2
+  # ============================================================
+
+      - name: Run Ansible playbook
+        id: ansible
+        if: steps.terraform_apply.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+    
+          ansible-playbook \
+            -i inventory.ini \
+            "${ANSIBLE_PLAYBOOK}" \
+            --private-key "${HOME}/.ssh/ec2_key" \
+            2>&1 | tee ansible-output.txt
+    
+          ANSIBLE_EXIT_CODE=${PIPESTATUS[0]}
+    
+          echo "exit_code=${ANSIBLE_EXIT_CODE}" >> "${GITHUB_OUTPUT}"
+    
+          exit "${ANSIBLE_EXIT_CODE}"
+
+  # ============================================================
+  # 17. Display Ansible output
+  # ============================================================
+
+      - name: Display Ansible output
+        if: always()
+        run: |
+          if [ -f ansible-output.txt ]; then
+            cat ansible-output.txt
+          else
+            echo "No Ansible output available."
+          fi
+
+  # ============================================================
+  # 18. Terraform Destroy
+  #
+  # Runs even if Ansible fails.
+  # ============================================================
+
+      - name: Terraform Destroy
+        id: terraform_destroy
+        if: always() && steps.terraform_init.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "Destroying AWS infrastructure..."
+    
+          terraform destroy \
+            -auto-approve \
+            -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
+            -var="allowed_ip=${{ steps.runner_ip.outputs.ip }}"
+
+  # ============================================================
+  # 19. Publish result to PR
+  # ============================================================
+
+      - name: Publish result to PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TERRAFORM_INIT_RESULT: ${{ steps.terraform_init.outcome }}
+          TERRAFORM_VALIDATE_RESULT: ${{ steps.terraform_validate.outcome }}
+          TERRAFORM_PLAN_RESULT: ${{ steps.terraform_plan.outcome }}
+          TERRAFORM_APPLY_RESULT: ${{ steps.terraform_apply.outcome }}
+          WAIT_SSH_RESULT: ${{ steps.wait_ssh.outcome }}
+          ANSIBLE_PING_RESULT: ${{ steps.ansible_ping.outcome }}
+          ANSIBLE_RESULT: ${{ steps.ansible.outcome }}
+          ANSIBLE_EXIT_CODE: ${{ steps.ansible.outputs.exit_code }}
+          TERRAFORM_DESTROY_RESULT: ${{ steps.terraform_destroy.outcome }}
+          EC2_IP: ${{ steps.ec2.outputs.ip }}
+        with:
+          script: |
+            const fs = require('fs');
+    
+            let ansibleOutput = 'No Ansible output available.';
+    
+            if (fs.existsSync('ansible-output.txt')) {
+              ansibleOutput = fs.readFileSync(
+                'ansible-output.txt',
+                'utf8'
+              );
+            }
+    
+            if (ansibleOutput.length > 12000) {
+              ansibleOutput =
+                '... output truncated ...\n\n' +
+                ansibleOutput.slice(-12000);
+            }
+    
+            const terraformApplySuccess =
+              process.env.TERRAFORM_APPLY_RESULT === 'success';
+    
+            const ansibleSuccess =
+              process.env.ANSIBLE_RESULT === 'success';
+    
+            const destroySuccess =
+              process.env.TERRAFORM_DESTROY_RESULT === 'success';
+    
+            const overallSuccess =
+              terraformApplySuccess &&
+              ansibleSuccess &&
+              destroySuccess;
+    
+            const status = overallSuccess
+              ? '✅ SUCCESS'
+              : '❌ FAILED';
+    
+            const body = `
+            ## 🚀 AWS Integration Test — ${status}
+    
+            **Commit:** \`${context.payload.pull_request.head.sha}\`
+    
+            **EC2:** \`${process.env.EC2_IP || 'Not created'}\`
+    
+            ### Pipeline Results
+    
+            | Stage | Result |
+            |---|---|
+            | Terraform Init | ${process.env.TERRAFORM_INIT_RESULT} |
+            | Terraform Validate | ${process.env.TERRAFORM_VALIDATE_RESULT} |
+            | Terraform Plan | ${process.env.TERRAFORM_PLAN_RESULT} |
+            | Terraform Apply | ${process.env.TERRAFORM_APPLY_RESULT} |
+            | Wait for SSH | ${process.env.WAIT_SSH_RESULT || 'Not run'} |
+            | Ansible Ping | ${process.env.ANSIBLE_PING_RESULT || 'Not run'} |
+            | Ansible Playbook | ${process.env.ANSIBLE_RESULT || 'Not run'} |
+            | Ansible Exit Code | ${process.env.ANSIBLE_EXIT_CODE || 'N/A'} |
+            | Terraform Destroy | ${process.env.TERRAFORM_DESTROY_RESULT} |
+    
+            <details>
+            <summary>📋 Ansible output</summary>
+    
+            \`\`\`text
+            ${ansibleOutput}
+            \`\`\`
+    
+            </details>
+    
+            ### Infrastructure Cleanup
+    
+            ${
+              destroySuccess
+                ? '✅ AWS infrastructure successfully destroyed.'
+                : '❌ AWS infrastructure cleanup failed. Check the workflow logs.'
+            }
+    
+            _Generated automatically by GitHub Actions._
+            `;
+    
+            const comments =
+              await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+    
+            const marker = '## 🚀 AWS Integration Test';
+    
+            const existingComment =
+              comments.data.find(comment =>
+                comment.user.type === 'Bot' &&
+                comment.body.includes(marker)
+              );
+    
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+  # ============================================================
+  # 20. Final pipeline status
+  #
+  # This is the step that makes the GitHub check fail.
+  # It runs AFTER cleanup and PR reporting.
+  # ============================================================
+
+      - name: Final pipeline status
+        if: always()
+        run: |
+    
+          FAILED=0
+    
+          if [ "${{ steps.terraform_apply.outcome }}" != "success" ]; then
+            echo "❌ Terraform Apply failed."
+            FAILED=1
+          fi
+    
+          if [ "${{ steps.terraform_apply.outcome }}" = "success" ]; then
+    
+            if [ "${{ steps.wait_ssh.outcome }}" != "success" ]; then
+              echo "❌ EC2 SSH connection failed."
+              FAILED=1
+            fi
+    
+            if [ "${{ steps.ansible_ping.outcome }}" != "success" ]; then
+              echo "❌ Ansible connection failed."
+              FAILED=1
+            fi
+    
+            if [ "${{ steps.ansible.outcome }}" != "success" ]; then
+              echo "❌ Ansible playbook failed."
+              FAILED=1
+            fi
+    
+          fi
+    
+          if [ "${{ steps.terraform_destroy.outcome }}" != "success" ]; then
+            echo "❌ Terraform Destroy failed."
+            FAILED=1
+          fi
+    
+          if [ "${FAILED}" -eq 1 ]; then
+            echo "❌ Pipeline failed."
+            exit 1
+          fi
+    
+          echo "✅ Pipeline completed successfully."
