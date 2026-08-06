@@ -18,9 +18,10 @@ env:
 
 jobs:
   deploy-test-destroy:
-    name: Terraform -> Ansible -> Test -> Destroy
+    name: ECU-Integration Test
     runs-on: ubuntu-latest
-
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
 
     steps:
 
@@ -153,7 +154,7 @@ jobs:
         run: |
           cat > inventory.ini <<EOF
           [virtual_ecu]
-          ${{ steps.ec2.outputs.ip }} ansible_user=ec2-user
+          ${{ steps.ec2.outputs.ip }} ansible_user=ubuntu
           EOF
     
           echo "Ansible inventory:"
@@ -177,7 +178,7 @@ jobs:
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=5 \
-              "ec2-user@${{ steps.ec2.outputs.ip }}" \
+              "ubuntu@${{ steps.ec2.outputs.ip }}" \
               "echo SSH_READY" 2>/dev/null; then
     
               echo "EC2 SSH is ready."
@@ -202,15 +203,16 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install ansible
 
-      # ============================================================
-      # 15. Test Ansible connection
-      # ============================================================
+  # ============================================================
+  # 15. Test Ansible connection
+  # ============================================================
 
       - name: Test Ansible connection
         id: ansible_ping
         if: steps.terraform_apply.outcome == 'success'
         continue-on-error: true
         run: |
+          ANSIBLE_HOST_KEY_CHECKING=False \
           ansible \
             -i inventory.ini \
             virtual_ecu \
@@ -227,17 +229,18 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-    
+      
+          ANSIBLE_HOST_KEY_CHECKING=False \
           ansible-playbook \
             -i inventory.ini \
             "${ANSIBLE_PLAYBOOK}" \
             --private-key "${HOME}/.ssh/ec2_key" \
             2>&1 | tee ansible-output.txt
-    
+      
           ANSIBLE_EXIT_CODE=${PIPESTATUS[0]}
-    
+      
           echo "exit_code=${ANSIBLE_EXIT_CODE}" >> "${GITHUB_OUTPUT}"
-    
+      
           exit "${ANSIBLE_EXIT_CODE}"
 
   # ============================================================
@@ -401,9 +404,6 @@ jobs:
 
   # ============================================================
   # 20. Final pipeline status
-  #
-  # This is the step that makes the GitHub check fail.
-  # It runs AFTER cleanup and PR reporting.
   # ============================================================
 
       - name: Final pipeline status
